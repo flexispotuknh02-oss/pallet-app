@@ -11,7 +11,7 @@ from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
-VER = '2.1.0'
+VER = '2.2.0'
 
 def get_now_date_str():
     return time.strftime('%Y%m%d', time.localtime())
@@ -148,8 +148,12 @@ def process_single(file_path, result_path, system_pallets):
     table_x = 32.9
     table_y = 101.2
     
-    lines_cord = [468.27, 376.8, 285.34, 193.87]
-    cord_ver_line = [358.89, 559.56, 101.2, 559.56]
+    # 严格匹配原版的非等高 4 条横线 Y 坐标
+    lines_cord = [440.0, 320.0, 200.0, 150.0]
+    
+    # 修正竖线：x1 和 x2 必须都是 340.0（垂直竖线，绝不产生斜杠）
+    ver_line_x = 340.0
+    
     fields = ['Position:', 'SKU:', 'Quantity:', 'Inbound Order:', 'Date:']
     
     wb = load_workbook(file_path)
@@ -171,40 +175,63 @@ def process_single(file_path, result_path, system_pallets):
         date_str = record[4] if len(record) > 4 else ""
         
         pallet_no = pallet_mapping.get(idx, "N/A")
-        qty_pallet_display = f"{count}   |   Pallet: #{pallet_no}"
+        
+        # Quantity 与 Pallet 合并显示
+        if pallet_no != "N/A":
+            qty_pallet_display = f"{count}  (Pallet: #{pallet_no})"
+        else:
+            qty_pallet_display = f"{count}"
         
         data_list = [location, sku, qty_pallet_display, inbound_order, date_str]
         
+        # 1. 绘制外框
         my_canvas.rect(table_x, table_y, table_w, table_h)
+        
+        # 2. 绘制 4 条不等高横线
         for line_y in lines_cord:
             my_canvas.line(table_x, line_y, table_x + table_w, line_y)
-        my_canvas.line(cord_ver_line[0], cord_ver_line[2], cord_ver_line[1], cord_ver_line[3])
+            
+        # 3. 绘制垂直分割竖线
+        my_canvas.line(ver_line_x, table_y, ver_line_x, table_y + table_h)
+        
+        # 4. 写入字段名与值（调整文字 Y 轴位置与字号以完美贴合老版样式）
+        # 各行 Baseline Y 坐标
+        y_positions = [465.0, 350.0, 230.0, 162.0, 113.0]
         
         for i in range(5):
-            if i == 0: y = 485.0
-            elif i == 1: y = 390.0
-            elif i == 2: y = 300.0
-            elif i == 3: y = 208.0
-            else: y = 117.0
-                
-            my_canvas.setFont('Calibri', 32)
-            my_canvas.drawString(table_x + 13.46, y, fields[i])
-            
+            y = y_positions[i]
             val = data_list[i]
-            if i in [0, 1]:
-                if len(val) > 18: my_canvas.setFont('Calibri', 25)
-                elif len(val) > 9: my_canvas.setFont('Calibri', 50)
-                else: my_canvas.setFont('Calibri', 80)
-                my_canvas.drawString(cord_ver_line[0] + 13.46, y, val)
-            elif i == 2:
-                my_canvas.setFont('Calibri', 42)
-                my_canvas.drawString(cord_ver_line[0] + 13.46, y, val)
+            
+            # 左侧标题（前三行超大字体，后两行小字体）
+            if i in [0, 1, 2]:
+                my_canvas.setFont('Calibri', 52)
             else:
-                if len(val) > 29: my_canvas.setFont('Calibri', 16)
-                else: my_canvas.setFont('Calibri', 32)
-                my_canvas.drawString(cord_ver_line[0] + 13.46, y, val)
+                my_canvas.setFont('Calibri', 24)
+            my_canvas.drawString(table_x + 15, y, fields[i])
+            
+            # 右侧数据值
+            if i in [0, 1]:  # Position, SKU
+                if len(val) > 22:
+                    my_canvas.setFont('Calibri', 28)
+                elif len(val) > 14:
+                    my_canvas.setFont('Calibri', 38)
+                else:
+                    my_canvas.setFont('Calibri', 48)
+                my_canvas.drawString(ver_line_x + 15, y, val)
                 
-        my_canvas.drawInlineImage(img_path, 230.29, 22.32, width=307.598, height=75.8965)
+            elif i == 2:  # Quantity + Pallet
+                if len(val) > 15:
+                    my_canvas.setFont('Calibri', 36)
+                else:
+                    my_canvas.setFont('Calibri', 52)
+                my_canvas.drawString(ver_line_x + 15, y, val)
+                
+            else:  # Inbound Order, Date
+                my_canvas.setFont('Calibri', 26)
+                my_canvas.drawString(ver_line_x + 15, y, val)
+                
+        # 5. 画底部 Logo
+        my_canvas.drawInlineImage(img_path, 230.29, 18.0, width=307.598, height=75.8965)
         my_canvas.showPage()
         
     my_canvas.save()
