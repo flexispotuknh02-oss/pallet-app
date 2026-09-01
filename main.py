@@ -11,7 +11,7 @@ from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
-VER = '2.2.0'
+VER = '2.3.0'
 
 def get_now_date_str():
     return time.strftime('%Y%m%d', time.localtime())
@@ -148,10 +148,7 @@ def process_single(file_path, result_path, system_pallets):
     table_x = 32.9
     table_y = 101.2
     
-    # 严格匹配原版的非等高 4 条横线 Y 坐标
     lines_cord = [440.0, 320.0, 200.0, 150.0]
-    
-    # 修正竖线：x1 和 x2 必须都是 340.0（垂直竖线，绝不产生斜杠）
     ver_line_x = 340.0
     
     fields = ['Position:', 'SKU:', 'Quantity:', 'Inbound Order:', 'Date:']
@@ -167,6 +164,8 @@ def process_single(file_path, result_path, system_pallets):
             
     pallet_mapping = build_pallet_mapping(raw_excel_rows, system_pallets)
     
+    # 构建待生成页面列表
+    pages_data = []
     for idx, record in enumerate(raw_excel_rows):
         location = record[0]
         sku = record[1] if len(record) > 1 else ""
@@ -176,33 +175,47 @@ def process_single(file_path, result_path, system_pallets):
         
         pallet_no = pallet_mapping.get(idx, "N/A")
         
-        # Quantity 与 Pallet 合并显示
         if pallet_no != "N/A":
             qty_pallet_display = f"{count}  (Pallet: #{pallet_no})"
         else:
             qty_pallet_display = f"{count}"
-        
-        data_list = [location, sku, qty_pallet_display, inbound_order, date_str]
+            
+        pages_data.append({
+            'pallet_no': pallet_no,
+            'data_list': [location, sku, qty_pallet_display, inbound_order, date_str]
+        })
+
+    # 核心新增：按托盘尾号数字排序，N/A 统一排到最后
+    def get_sort_key(item):
+        p = item['pallet_no']
+        if p != "N/A" and p.isdigit():
+            return (0, int(p))  # 0 保证数字排在前面，按整数大小升序
+        return (1, 999999)      # 1 保证 N/A 排在最后
+
+    pages_data.sort(key=get_sort_key)
+    
+    # 按照排序后的顺序绘制 PDF 页面
+    for page in pages_data:
+        data_list = page['data_list']
         
         # 1. 绘制外框
         my_canvas.rect(table_x, table_y, table_w, table_h)
         
-        # 2. 绘制 4 条不等高横线
+        # 2. 绘制横线
         for line_y in lines_cord:
             my_canvas.line(table_x, line_y, table_x + table_w, line_y)
             
-        # 3. 绘制垂直分割竖线
+        # 3. 绘制垂直分割线
         my_canvas.line(ver_line_x, table_y, ver_line_x, table_y + table_h)
         
-        # 4. 写入字段名与值（调整文字 Y 轴位置与字号以完美贴合老版样式）
-        # 各行 Baseline Y 坐标
+        # 4. 写入字段名与值
         y_positions = [465.0, 350.0, 230.0, 162.0, 113.0]
         
         for i in range(5):
             y = y_positions[i]
             val = data_list[i]
             
-            # 左侧标题（前三行超大字体，后两行小字体）
+            # 左侧标题
             if i in [0, 1, 2]:
                 my_canvas.setFont('Calibri', 52)
             else:
