@@ -14,7 +14,7 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install pyinstaller openpyxl reportlab
+        pip install pyinstaller openpyxl reportlab pywin32
     - name: Build EXE
       run: |
         pyinstaller -F -w main.py
