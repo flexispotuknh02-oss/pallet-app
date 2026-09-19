@@ -12,15 +12,7 @@ from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
-# 用于读取“正在打开、尚未保存”的 Excel 内容（仅 Windows，需要 pywin32）
-try:
-    import pythoncom
-    import win32com.client
-    HAS_COM = True
-except ImportError:
-    HAS_COM = False
-
-VER = '2.5.0'
+VER = '2.7.0'
 
 XLSM_NAME = '自动化上架计划 (已修复).xlsm'
 PLAN_SHEET = '2-上架计划'
@@ -44,6 +36,9 @@ def data_format(cell):
     return str(value).strip()
 
 
+# ---------------------------------------------------------------
+# 柜号读取
+# ---------------------------------------------------------------
 def clean_container_no(value):
     """去掉文件名里不允许的字符和空白；空值返回 None"""
     if value is None:
@@ -52,50 +47,72 @@ def clean_container_no(value):
     return text or None
 
 
-def get_container_no_live():
+# 标准集装箱号（ISO 6346）：3 位箱主代码 + 1 位设备类别(U/J/Z/R) + 6 位序列号 + 1 位校验位
+CONTAINER_RE = re.compile(r'(?<![A-Z0-9])[A-Z]{3}[UJZR]\d{7}(?![A-Z0-9])')
+
+
+def iso6346_check_ok(code):
+    """校验位检查，用来排除偶然长得像柜号的其他编号"""
+    values = {}
+    v = 10
+    for ch in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ':
+        if v % 11 == 0:      # 11、22、33 被跳过
+            v += 1
+        values[ch] = v
+        v += 1
+    total = 0
+    for i, ch in enumerate(code[:10]):
+        n = values[ch] if ch.isalpha() else int(ch)
+        total += n * (2 ** i)
+    return total % 11 % 10 == int(code[10])
+
+
+def find_table_start(lines):
+    """托盘明细表开始的位置（序号 1 后面紧跟托盘号）；找不到则返回 len(lines)"""
+    n = len(lines)
+    for i in range(n):
+        if lines[i] == '1' and i + 1 < n and '-' in lines[i + 1]:
+            return i
+    return n
+
+
+def find_container_no(lines):
     """
-    直接从正在运行的 Excel 里读取 F1（F1:G1 合并单元格），
-    读到的是内存中的当前内容，即使没有保存也是最新的。
+    从『收货详情.txt』表头里找柜号，与界面语言无关：
+      ① 优先按标准集装箱号格式（4 个字母 + 7 位数字）在表头里查找，并用校验位排除误判；
+      ② 找不到（比如运单号不是标准格式）时，取入库单号（ASN-开头的单独一行）往后第 2 行的内容。
+    返回 (柜号或 None, 日志信息)
     """
-    if not HAS_COM:
-        return None, "未安装 pywin32，无法读取正在打开的 Excel"
+    header = [ln.upper() for ln in lines[:find_table_start(lines)]]
 
-    pythoncom.CoInitialize()  # 本函数在子线程中运行，必须初始化 COM
-    app = target = ws = None
-    try:
-        try:
-            app = win32com.client.GetActiveObject("Excel.Application")
-        except Exception:
-            return None, "未检测到正在运行的 Excel"
+    candidates = []
+    for ln in header:
+        for m in CONTAINER_RE.findall(ln):
+            if m not in candidates:
+                candidates.append(m)
 
-        for wb in app.Workbooks:
-            if wb.Name.lower() == XLSM_NAME.lower():
-                target = wb
-                break
-        if target is None:
-            return None, f"Excel 中没有打开 '{XLSM_NAME}'"
+    valid = [c for c in candidates if iso6346_check_ok(c)]
+    if valid:
+        extra = f"（另有其他候选 {[c for c in candidates if c != valid[0]]}，已取第一个）" if len(candidates) > 1 else ''
+        return valid[0], f"从收货详情读取到柜号: {valid[0]}{extra}"
+    if candidates:
+        return candidates[0], f"从收货详情读取到柜号: {candidates[0]}（校验位不符，请核对是否正确）"
 
-        try:
-            ws = target.Worksheets(PLAN_SHEET)
-        except Exception:
-            ws = target.ActiveSheet
+    # 兜底：ASN 单号所在行 + 2 行 = 集装箱号/运单号
+    for i, ln in enumerate(header):
+        if re.fullmatch(r'ASN-[A-Z0-9-]+', ln) and i + 2 < len(header):
+            value = clean_container_no(header[i + 2])
+            if value and re.fullmatch(r'[A-Z0-9-]{6,}', value):
+                return value, f"从收货详情读取到单号: {value}（不是标准集装箱号格式，请核对）"
 
-        container_no = clean_container_no(ws.Range("F1").Value)
-        if container_no is None:
-            return None, "Excel 中 F1 单元格为空"
-        return container_no, f"成功读取 Excel 当前柜号（实时）: {container_no}"
-    except Exception as e:
-        return None, f"读取正在打开的 Excel 失败（可能正处于单元格编辑状态）: {e}"
-    finally:
-        app = target = ws = None
-        pythoncom.CoUninitialize()
+    return None, "收货详情里没有找到柜号"
 
 
 def get_container_no_from_disk():
-    """从桌面已保存的 xlsm 文件读取 F1（注意：只是上次保存时的内容，可能不是最新）"""
+    """备用：从桌面已保存的 xlsm 文件读取 F1（只是上次保存时的内容，可能不是最新）"""
     xlsm_path = os.path.join(get_desktop_path(), XLSM_NAME)
     if not os.path.exists(xlsm_path):
-        return None, f"未在桌面找到 '{XLSM_NAME}'，请检查路径: {xlsm_path}"
+        return None, f"未在桌面找到 '{XLSM_NAME}'"
 
     try:
         wb = load_workbook(xlsm_path, data_only=True)
@@ -111,22 +128,12 @@ def get_container_no_from_disk():
     return container_no, f"读取到磁盘文件里保存的柜号: {container_no}"
 
 
-def get_container_no():
-    """
-    优先读取正在打开的 Excel（实时），失败再读磁盘文件。
-    返回 (柜号, 日志信息, 是否实时读取)
-    """
-    live_no, live_msg = get_container_no_live()
-    if live_no:
-        return live_no, live_msg, True
-
-    disk_no, disk_msg = get_container_no_from_disk()
-    return disk_no, f"{live_msg}\n{disk_msg}", False
-
-
-def parse_txt_from_desktop():
-    desktop_dir = get_desktop_path()
-    txt_path = os.path.join(desktop_dir, '收货详情.txt')
+# ---------------------------------------------------------------
+# 收货详情.txt
+# ---------------------------------------------------------------
+def read_receipt_lines():
+    """读取桌面『收货详情.txt』，返回 (行列表或 None, 错误信息)"""
+    txt_path = os.path.join(get_desktop_path(), '收货详情.txt')
 
     if not os.path.exists(txt_path):
         return None, f"未在桌面找到 '收货详情.txt' 文件，请检查路径: {txt_path}"
@@ -137,15 +144,14 @@ def parse_txt_from_desktop():
     except UnicodeDecodeError:
         with open(txt_path, 'r', encoding='gbk') as f:
             lines = [line.strip() for line in f.readlines()]
+    return lines, ''
 
+
+def parse_receipt_pallets(lines):
+    """解析托盘明细，返回 (托盘列表, 日志信息)"""
     system_pallets = []
-    i = 0
     n = len(lines)
-
-    while i < n:
-        if lines[i] == '1' and i + 1 < n and '-' in lines[i+1]:
-            break
-        i += 1
+    i = find_table_start(lines)
 
     while i + 5 < n:
         seq = lines[i]
@@ -356,28 +362,33 @@ def thread_exc(func, *args, **kwargs):
 
 
 def process(file_dir, log_widget):
-    system_pallets, txt_msg = parse_txt_from_desktop()
-    log_widget.insert(tk.END, f'{txt_msg}\n')
+    lines, read_err = read_receipt_lines()
 
-    if system_pallets is None:
+    if lines is None:
+        log_widget.insert(tk.END, f'{read_err}\n')
         log_widget.insert(tk.END, '无法读取桌面 txt，将默认以 N/A 生成标签！\n')
         system_pallets = []
+        container_no = None
+    else:
+        system_pallets, txt_msg = parse_receipt_pallets(lines)
+        log_widget.insert(tk.END, f'{txt_msg}\n')
+        container_no, container_msg = find_container_no(lines)
+        log_widget.insert(tk.END, f'{container_msg}\n')
 
-    # 读取集装箱号（用于 PDF 命名）
-    container_no, container_msg, is_live = get_container_no()
-    log_widget.insert(tk.END, f'{container_msg}\n')
-
-    # 只读到了磁盘上的旧文件时，柜号可能不是最新的，必须让用户确认
-    if container_no and not is_live:
-        log_widget.insert(tk.END, '注意：未能读取 Excel 当前内容，磁盘文件里的柜号可能不是最新的！\n')
-        use_it = messagebox.askyesno(
-            '确认柜号',
-            f'无法读取正在打开的 Excel。\n\n磁盘文件里保存的柜号是：{container_no}\n'
-            f'如果你还没保存过最新的柜号，这个号码可能是旧的。\n\n'
-            f'是否仍用它命名 PDF？\n（选"否"则改用原 Excel 文件名命名）'
-        )
-        if not use_it:
-            container_no = None
+    # 收货详情里没找到柜号时，才退回读取磁盘上的 xlsm（可能是旧的，需要用户确认）
+    if container_no is None:
+        disk_no, disk_msg = get_container_no_from_disk()
+        log_widget.insert(tk.END, f'{disk_msg}\n')
+        if disk_no:
+            log_widget.insert(tk.END, '注意：磁盘文件里的柜号可能不是最新的！\n')
+            use_it = messagebox.askyesno(
+                '确认柜号',
+                f'收货详情里没有找到柜号。\n\n磁盘上已保存的 Excel 里的柜号是：{disk_no}\n'
+                f'如果你还没保存过最新的柜号，这个号码可能是旧的。\n\n'
+                f'是否仍用它命名 PDF？\n（选"否"则改用原 Excel 文件名命名）'
+            )
+            if use_it:
+                container_no = disk_no
 
     if container_no is None:
         log_widget.insert(tk.END, '将使用原 Excel 文件名命名 PDF。\n')
