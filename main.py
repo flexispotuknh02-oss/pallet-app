@@ -12,7 +12,18 @@ from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
-VER = '2.4.0'
+# 用于读取“正在打开、尚未保存”的 Excel 内容（仅 Windows，需要 pywin32）
+try:
+    import pythoncom
+    import win32com.client
+    HAS_COM = True
+except ImportError:
+    HAS_COM = False
+
+VER = '2.5.0'
+
+XLSM_NAME = '自动化上架计划 (已修复).xlsm'
+PLAN_SHEET = '2-上架计划'
 
 
 def get_now_date_str():
@@ -33,27 +44,84 @@ def data_format(cell):
     return str(value).strip()
 
 
-def get_container_no():
-    """从桌面『自动化上架计划 (已修复).xlsm』的 F1（F1:G1 合并单元格）读取集装箱号"""
-    xlsm_path = os.path.join(get_desktop_path(), '自动化上架计划 (已修复).xlsm')
+def clean_container_no(value):
+    """去掉文件名里不允许的字符和空白；空值返回 None"""
+    if value is None:
+        return None
+    text = re.sub(r'[\\/:*?"<>|\s]', '', str(value))
+    return text or None
+
+
+def get_container_no_live():
+    """
+    直接从正在运行的 Excel 里读取 F1（F1:G1 合并单元格），
+    读到的是内存中的当前内容，即使没有保存也是最新的。
+    """
+    if not HAS_COM:
+        return None, "未安装 pywin32，无法读取正在打开的 Excel"
+
+    pythoncom.CoInitialize()  # 本函数在子线程中运行，必须初始化 COM
+    app = target = ws = None
+    try:
+        try:
+            app = win32com.client.GetActiveObject("Excel.Application")
+        except Exception:
+            return None, "未检测到正在运行的 Excel"
+
+        for wb in app.Workbooks:
+            if wb.Name.lower() == XLSM_NAME.lower():
+                target = wb
+                break
+        if target is None:
+            return None, f"Excel 中没有打开 '{XLSM_NAME}'"
+
+        try:
+            ws = target.Worksheets(PLAN_SHEET)
+        except Exception:
+            ws = target.ActiveSheet
+
+        container_no = clean_container_no(ws.Range("F1").Value)
+        if container_no is None:
+            return None, "Excel 中 F1 单元格为空"
+        return container_no, f"成功读取 Excel 当前柜号（实时）: {container_no}"
+    except Exception as e:
+        return None, f"读取正在打开的 Excel 失败（可能正处于单元格编辑状态）: {e}"
+    finally:
+        app = target = ws = None
+        pythoncom.CoUninitialize()
+
+
+def get_container_no_from_disk():
+    """从桌面已保存的 xlsm 文件读取 F1（注意：只是上次保存时的内容，可能不是最新）"""
+    xlsm_path = os.path.join(get_desktop_path(), XLSM_NAME)
     if not os.path.exists(xlsm_path):
-        return None, f"未在桌面找到 '自动化上架计划 (已修复).xlsm'，请检查路径: {xlsm_path}"
+        return None, f"未在桌面找到 '{XLSM_NAME}'，请检查路径: {xlsm_path}"
 
     try:
         wb = load_workbook(xlsm_path, data_only=True)
-        value = wb.active['F1'].value
+        ws = wb[PLAN_SHEET] if PLAN_SHEET in wb.sheetnames else wb.active
+        value = ws['F1'].value
         wb.close()
     except Exception as e:
-        return None, f"读取集装箱号失败: {e}"
+        return None, f"读取磁盘文件失败: {e}"
 
-    if value is None or not str(value).strip():
-        return None, "F1 单元格为空，未读取到集装箱号"
+    container_no = clean_container_no(value)
+    if container_no is None:
+        return None, "磁盘文件中 F1 单元格为空"
+    return container_no, f"读取到磁盘文件里保存的柜号: {container_no}"
 
-    # 去掉文件名里不允许的字符和空白
-    container_no = re.sub(r'[\\/:*?"<>|\s]', '', str(value))
-    if not container_no:
-        return None, "F1 单元格内容无效，未读取到集装箱号"
-    return container_no, f"成功读取集装箱号: {container_no}"
+
+def get_container_no():
+    """
+    优先读取正在打开的 Excel（实时），失败再读磁盘文件。
+    返回 (柜号, 日志信息, 是否实时读取)
+    """
+    live_no, live_msg = get_container_no_live()
+    if live_no:
+        return live_no, live_msg, True
+
+    disk_no, disk_msg = get_container_no_from_disk()
+    return disk_no, f"{live_msg}\n{disk_msg}", False
 
 
 def parse_txt_from_desktop():
@@ -296,8 +364,21 @@ def process(file_dir, log_widget):
         system_pallets = []
 
     # 读取集装箱号（用于 PDF 命名）
-    container_no, container_msg = get_container_no()
+    container_no, container_msg, is_live = get_container_no()
     log_widget.insert(tk.END, f'{container_msg}\n')
+
+    # 只读到了磁盘上的旧文件时，柜号可能不是最新的，必须让用户确认
+    if container_no and not is_live:
+        log_widget.insert(tk.END, '注意：未能读取 Excel 当前内容，磁盘文件里的柜号可能不是最新的！\n')
+        use_it = messagebox.askyesno(
+            '确认柜号',
+            f'无法读取正在打开的 Excel。\n\n磁盘文件里保存的柜号是：{container_no}\n'
+            f'如果你还没保存过最新的柜号，这个号码可能是旧的。\n\n'
+            f'是否仍用它命名 PDF？\n（选"否"则改用原 Excel 文件名命名）'
+        )
+        if not use_it:
+            container_no = None
+
     if container_no is None:
         log_widget.insert(tk.END, '将使用原 Excel 文件名命名 PDF。\n')
 
